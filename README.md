@@ -1,4 +1,4 @@
-# NURBS VQ-VAE + 点云条件 CAD 生成
+﻿# NURBS VQ-VAE + 点云条件 CAD 生成
 
 本仓库当前用于研究基于 NURBS VQ-VAE token 的点云条件 CAD 生成。
 
@@ -49,11 +49,11 @@ Point2CAD constrained decoding，val414:
 
 ## 数据目录
 
-当前服务器实验使用的数据路径：
+默认数据路径：
 
 ```text
-/mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/ABC_Dataset_NEW
-/mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/ABC_Dataset_NEW_parsed
+data/ABC_Dataset_NEW
+data/ABC_Dataset_NEW_parsed
 ```
 
 原始 CAD 模型目录结构：
@@ -121,11 +121,11 @@ PAD:        3125
 
 ```bash
 python resample_pointclouds_from_step.py \
-  --root /mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/ABC_Dataset_NEW \
+  --root data/ABC_Dataset_NEW \
   --num_points 4096 \
   --overwrite \
   --timeout 120 \
-  --report_json /mnt/docker_dir/lijiahao/NurbsVQVAE_code/resample_full_report.json
+  --report_json resample_full_report.json
 ```
 
 重采样结果：
@@ -140,8 +140,8 @@ failed: 54
 
 ```bash
 python inspect_pointcloud_quality.py \
-  --root /mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/ABC_Dataset_NEW \
-  --output_dir /mnt/docker_dir/lijiahao/NurbsVQVAE_code/pointcloud_quality_report_full
+  --root data/ABC_Dataset_NEW \
+  --output_dir pointcloud_quality_report_full
 ```
 
 质量检查结果：
@@ -159,10 +159,10 @@ avg_valid_ratio: 0.9977
 
 ```bash
 python build_full_parsed_pointcloud_split.py \
-  --parsed_dir /mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/ABC_Dataset_NEW_parsed \
-  --records_json /mnt/docker_dir/lijiahao/NurbsVQVAE_code/pointcloud_quality_report_full/pointcloud_records.json \
-  --output_split_file /mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/furniture_data_split_6bit_allparsed_pc_clean_split.pkl \
-  --output_stats_json /mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/furniture_data_split_6bit_allparsed_pc_clean_stats.json \
+  --parsed_dir data/ABC_Dataset_NEW_parsed \
+  --records_json pointcloud_quality_report_full/pointcloud_records.json \
+  --output_split_file data/furniture_data_split_6bit_allparsed_pc_clean_split.pkl \
+  --output_stats_json data/furniture_data_split_6bit_allparsed_pc_clean_stats.json \
   --val_ratio 0.05
 ```
 
@@ -181,11 +181,11 @@ val: 668
 
 ```bash
 python 2sequence_nurbs_v2.py \
-  --data_list /mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/furniture_data_split_6bit_allparsed_pc_clean_split.pkl \
-  --records_json /mnt/docker_dir/lijiahao/NurbsVQVAE_code/pointcloud_quality_report_full/pointcloud_records.json \
-  --pointcloud_root /mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/ABC_Dataset_NEW \
-  --ckpt_path /mnt/docker_dir/lijiahao/NurbsVQVAE_code/checkpoint/se/abc/8192,4096,128,64,false,1e-4,0,p/deepcad_nurbs_vqvae_best.pt \
-  --output_file /mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/furniture_nurbs_sequences_allparsed_pc_clean_v2.pkl \
+  --data_list data/furniture_data_split_6bit_allparsed_pc_clean_split.pkl \
+  --records_json pointcloud_quality_report_full/pointcloud_records.json \
+  --pointcloud_root data/ABC_Dataset_NEW \
+  --ckpt_path checkpoints/vqvae/deepcad_nurbs_vqvae_best.pt \
+  --output_file data/furniture_nurbs_sequences_allparsed_pc_clean_v2.pkl \
   --device cuda:0
 ```
 
@@ -213,12 +213,12 @@ missing_model_id: 0
 
 ```bash
 python debug_reconstruct_sequence_v2.py \
-  --sequence_file /mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/furniture_nurbs_sequences_allparsed_pc_clean_v2.pkl \
-  --ckpt_path /mnt/docker_dir/lijiahao/NurbsVQVAE_code/checkpoint/se/abc/8192,4096,128,64,false,1e-4,0,p/deepcad_nurbs_vqvae_best.pt \
+  --sequence_file data/furniture_nurbs_sequences_allparsed_pc_clean_v2.pkl \
+  --ckpt_path checkpoints/vqvae/deepcad_nurbs_vqvae_best.pt \
   --split val \
   --index 0 \
   --max_samples 50 \
-  --output_dir /mnt/docker_dir/lijiahao/NurbsVQVAE_code/result/debug_reconstruct_sequence_v2_val50 \
+  --output_dir result/debug_reconstruct_sequence_v2_val50 \
   --gpu 0
 ```
 
@@ -239,11 +239,11 @@ valid_rate: 0.92
 
 ```bash
 torchrun --nproc_per_node=2 train_ar.py \
-  --sequence_file /mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/furniture_nurbs_sequences_allparsed_pc_clean_v2.pkl \
-  --point_cloud_dir /mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/ABC_Dataset_NEW \
-  --data_list_file /mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/furniture_data_split_6bit_allparsed_pc_clean_split.pkl \
-  --save_dir /mnt/docker_dir/lijiahao/NurbsVQVAE_code/checkpoints/ar_pc_allparsed_clean_v2_bbox_ddp_seq2048_bs2 \
-  --tb_log_dir /mnt/docker_dir/lijiahao/NurbsVQVAE_code/logs/ar_pc_allparsed_clean_v2_bbox_ddp_seq2048_bs2 \
+  --sequence_file data/furniture_nurbs_sequences_allparsed_pc_clean_v2.pkl \
+  --point_cloud_dir data/ABC_Dataset_NEW \
+  --data_list_file data/furniture_data_split_6bit_allparsed_pc_clean_split.pkl \
+  --save_dir checkpoints/ar_pc_allparsed_clean_v2_bbox_ddp_seq2048_bs2 \
+  --tb_log_dir logs/ar_pc_allparsed_clean_v2_bbox_ddp_seq2048_bs2 \
   --max_seq_len 2048 \
   --batch_size 2 \
   --train_nepoch 1000 \
@@ -279,9 +279,9 @@ Perplexity:    1.89 ~ 1.91
 python - <<'PY'
 import os, pickle
 
-seq_file = "/mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/furniture_nurbs_sequences_allparsed_pc_clean_v2.pkl"
-pc_root = "/mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/ABC_Dataset_NEW"
-out_dir = "/mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/pc_val_v2"
+seq_file = "data/furniture_nurbs_sequences_allparsed_pc_clean_v2.pkl"
+pc_root = "data/ABC_Dataset_NEW"
+out_dir = "data/pc_val_v2"
 
 os.makedirs(out_dir, exist_ok=True)
 
@@ -305,11 +305,11 @@ PY
 
 ```bash
 python generate_cond.py \
-  --ar_model /mnt/docker_dir/lijiahao/NurbsVQVAE_code/checkpoints/ar_pc_allparsed_clean_v2_bbox_ddp_seq2048_bs2/deepcad_ar_point_best_model.pt \
-  --config /mnt/docker_dir/lijiahao/NurbsVQVAE_code/config.json \
-  --vqvae_ckpt /mnt/docker_dir/lijiahao/NurbsVQVAE_code/checkpoint/se/abc/8192,4096,128,64,false,1e-4,0,p/deepcad_nurbs_vqvae_best.pt \
-  --test_pc_dir /mnt/docker_dir/lijiahao/NurbsVQVAE_code/data/pc_val_v2 \
-  --output_dir /mnt/docker_dir/lijiahao/NurbsVQVAE_code/result/generated_cad_cond_v2_best_val_constrained_t07_final \
+  --ar_model checkpoints/ar_pc_allparsed_clean_v2_bbox_ddp_seq2048_bs2/deepcad_ar_point_best_model.pt \
+  --config config.json \
+  --vqvae_ckpt checkpoints/vqvae/deepcad_nurbs_vqvae_best.pt \
+  --test_pc_dir data/pc_val_v2 \
+  --output_dir result/generated_cad_cond_v2_best_val_constrained_t07_final \
   --gpu 0 \
   --point_cloud_npoints 2048 \
   --max_length 2048 \
@@ -404,3 +404,4 @@ zero-size array
 - 尝试基于 BREP validity 的 GRPO / reward fine-tuning。
 - 在 decoding 阶段加入更强的拓扑约束。
 - 分析成功/失败样本的 face count、edge count、sequence length 和几何类型。
+
