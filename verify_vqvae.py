@@ -34,6 +34,18 @@ def _collect_split_files(data_dir: str, split: str, split_ratio: float, seed: in
         return all_pkls
     raise ValueError(f"Unsupported split: {split}")
 
+
+def _collect_split_files_from_list(data_list: str, split: str) -> List[str]:
+    with open(data_list, "rb") as f:
+        split_data = pickle.load(f)
+
+    if split == "all":
+        files = []
+        for key in ("train", "val", "test"):
+            files.extend(split_data.get(key, []))
+        return files
+    return list(split_data.get(split, []))
+
 def _gather_eval_items(file_paths: Sequence[str], item_type: str, coord_key: str, max_items: Optional[int], seed: int):
     expected_rows = 16 if item_type == "face" else 4
     candidate_keys = pick_candidate_keys(coord_key, item_type)
@@ -209,7 +221,10 @@ def verify_model(args):
         f"num_vq_embeddings={model_kwargs['num_vq_embeddings']}"
     )
 
-    split_files = _collect_split_files(args.data_dir, args.split, args.split_ratio, args.seed)
+    if args.data_list:
+        split_files = _collect_split_files_from_list(args.data_list, args.split)
+    else:
+        split_files = _collect_split_files(args.data_dir, args.split, args.split_ratio, args.seed)
     print(f"Using split={args.split}, files={len(split_files)}, coord_key={args.coord_key}")
 
     face_items, face_skipped = _gather_eval_items(split_files, "face", args.coord_key, args.max_face_items, args.seed)
@@ -235,6 +250,7 @@ def parse_args():
         default="checkpoints_vqvae/restart_baseline/deepcad_nurbs_vqvae_best.pt",
     )
     parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR)
+    parser.add_argument("--data_list", type=str, default="", help="Optional split pickle with explicit file lists")
     parser.add_argument("--split", choices=["train", "val", "all"], default="val")
     parser.add_argument("--split_ratio", type=float, default=0.95)
     parser.add_argument("--seed", type=int, default=42)

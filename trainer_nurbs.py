@@ -331,11 +331,11 @@ class NurbsVQVAETrainer:
         self.vq_loss_weight = float(getattr(args, "vq_loss_weight", 1.0))
         self.best_metric_name = getattr(args, "best_metric", "recon_loss")
 
-        self.quantization_size = int(getattr(args, "quantization_size", 4096))
-        self.model_down_blocks = int(getattr(args, "model_down_blocks", 1))
+        self.quantization_size = int(getattr(args, "quantization_size", 1024))
+        self.model_down_blocks = int(getattr(args, "model_down_blocks", 2))
         self.base_channel_dim = int(getattr(args, "base_channel_dim", 64))
         self.latent_channels = int(getattr(args, "latent_channels", 128))
-        self.vq_embed_dim = int(getattr(args, "vq_embed_dim", 64))
+        self.vq_embed_dim = int(getattr(args, "vq_embed_dim", 32))
 
         if self.model_down_blocks < 1:
             raise ValueError(f"model_down_blocks must be >= 1, got {self.model_down_blocks}")
@@ -344,7 +344,7 @@ class NurbsVQVAETrainer:
             self.base_channel_dim * (2 ** idx) for idx in range(self.model_down_blocks)
         )
 
-        self.recon_l1_weight = float(getattr(args, "recon_l1_weight", 0.5))
+        self.recon_l1_weight = float(getattr(args, "recon_l1_weight", 0.0))
         self.face_boundary_weight = float(getattr(args, "face_boundary_weight", 0.0))
         self.face_corner_weight = float(getattr(args, "face_corner_weight", 0.0))
         self.edge_endpoint_weight = float(getattr(args, "edge_endpoint_weight", 0.0))
@@ -539,15 +539,7 @@ class NurbsVQVAETrainer:
         edge_endpoint_max = self._masked_group_max(abs_diff, edge_mask, self.edge_endpoint_mask)
         boundary_max_error = torch.maximum(face_boundary_max, edge_endpoint_max)
 
-        recon_loss = (
-            mse_loss
-            + self.recon_l1_weight * l1_loss
-            + self.face_boundary_weight * face_boundary_l1
-            + self.face_corner_weight * face_corner_l1
-            + self.edge_endpoint_weight * edge_endpoint_l1
-            + self.max_error_weight * max_abs_error
-            + self.boundary_max_error_weight * boundary_max_error
-        )
+        recon_loss = mse_loss
 
         metrics = {
             "mse_loss": mse_loss,

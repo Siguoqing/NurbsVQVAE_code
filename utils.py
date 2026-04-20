@@ -34,6 +34,7 @@ from OCC.Core.IFSelect import IFSelect_RetDone
 from OCC.Extend.TopologyUtils import TopologyExplorer, WireExplorer
 import OCC.Core.BRep
 from occwl.io import Solid, load_step
+from vqvae_eval_utils import load_model_from_checkpoint
 class ChamferDistance(nn.Module):
     def __init__(self):
         super().__init__()
@@ -72,6 +73,25 @@ class ChamferDistance(nn.Module):
 
 import shutup; shutup.please()
 
+
+_NURBS_VQVAE_CACHE = {}
+
+
+def get_nurbs_vqvae_checkpoint_path():
+    return os.environ.get(
+        "NURBS_VQVAE_CKPT",
+        "/mnt/docker_dir/lijiahao/NurbsVQVAE_code/checkpoint/se/abc/8192,4096,128,64,false,1e-4,0,p/deepcad_nurbs_vqvae_best.pt",
+    )
+
+
+def get_nurbs_vqvae_model(device="cpu"):
+    ckpt_path = get_nurbs_vqvae_checkpoint_path()
+    cache_key = (ckpt_path, str(device))
+    if cache_key not in _NURBS_VQVAE_CACHE:
+        model, model_kwargs = load_model_from_checkpoint(ckpt_path, device)
+        _NURBS_VQVAE_CACHE[cache_key] = (model, model_kwargs)
+    return _NURBS_VQVAE_CACHE[cache_key]
+
 ### 参数加载 ###
 
 def get_ar_args():
@@ -84,6 +104,9 @@ def get_ar_args():
     parser.add_argument('--max_edge', type=int, default=124, help='最大边数')
     parser.add_argument('--dataset_type', type=str, choices=['furniture', 'deepcad', 'abc'], default='deepcad', help='数据集类型')
     parser.add_argument('--max_seq_len', type=int, default=1597, help='最大序列长度')
+    parser.add_argument('--point_cloud_npoints', type=int, default=2048, help='条件点云统一采样点数')
+    parser.add_argument('--point_cloud_normalize', type=bool, default=True, help='是否对条件点云做去中心/归一化')
+    parser.add_argument('--length_bucket_mult', type=int, default=16, help='按序列长度分桶组batch的桶大小倍数')
     
     # === 训练基础参数 ===
     parser.add_argument('--batch_size', type=int, default=3, help='每张GPU的batch size')
@@ -102,6 +125,7 @@ def get_ar_args():
     parser.add_argument('--n_kv_heads', type=int, default=4, help='KV头数（GQA，n_heads/2=4）')
     parser.add_argument('--n_layers', type=int, default=8, help='Transformer层数（保持8）')
     parser.add_argument('--dim_feedforward', type=int, default=2048, help='FFN维度（4*d_model=1024）')
+    parser.add_argument('--point_prefix_tokens', type=int, default=8, help='点云条件映射成的 prefix token 数量')
     
     # === 训练优化开关 ===
     parser.add_argument('--use_amp', type=bool, default=True, help='使用混合精度训练（已启用，提速50%）')
@@ -556,143 +580,111 @@ def decode_tokens_to_ncs(tokens, vqvae_model, data_type='face', tokens_per_eleme
 
 def parse_sequence_to_cad_data_nurbs(sequence, vocab_info, device="cpu", verbose=False):
     """
-    解析由 _flatten_points 生成的 1D Token 序列为 NURBS CAD 数据。
-    
-    序列结构 (由 _flatten_points 定义):
+    解析当前 VQ-token 版 1D Token 序列为 NURBS CAD 数据。
+
+    当前协议:
     1. [START]
-    2. Face Block (直到 SEP): N 个面，每个面由 [48个坐标Token, 1个索引Token] 组成 (步长49)
+    2. Face Block (直到 SEP): N 个面，每个面由 [4个VQ token, 1个面索引] 组成 (步长5)
     3. [SEP]
-    4. Edge Block (直到 END): M 条边，每条边由 [2个索引Token, 12个坐标Token] 组成 (步长14)
+    4. Edge Block (直到 END): M 条边，每条边由 [2个面索引, 4个VQ token] 组成 (步长6)
     5. [END]
     """
-    
-    # 1. 获取词表配置
+
     face_index_offset = vocab_info['face_index_offset']
     quantization_offset = vocab_info['quantization_offset']
     quantization_size = vocab_info['quantization_size']
-    
+
     START_TOKEN = vocab_info['START_TOKEN']
     SEP_TOKEN = vocab_info['SEP_TOKEN']
     END_TOKEN = vocab_info['END_TOKEN']
-    
-    # 转换为 list 以便操作 (如果是 Tensor)
+
+    face_stride = int(vocab_info.get("face_block", 5))
+    edge_stride = int(vocab_info.get("edge_block", 6))
+    face_token_count = face_stride - 1
+    edge_token_count = edge_stride - 2
+
     if isinstance(sequence, torch.Tensor):
         sequence = sequence.cpu().tolist()
-    
+
     seq_len = len(sequence)
     if seq_len == 0:
         return {'face_ctrs': [], 'edge_ctrs': [], 'edgeFace_adj': [], 'graph_edges': ([], [])}
 
-    # 2. 定位关键分隔符位置
     try:
-        # 查找 SEP 的位置
         sep_idx = sequence.index(SEP_TOKEN)
     except ValueError:
         if verbose: print("Error: SEP_TOKEN not found in sequence.")
         return {'face_ctrs': [], 'edge_ctrs': [], 'edgeFace_adj': [], 'graph_edges': ([], [])}
-    
-    # 查找 END 的位置 (如果没有 END，则读取到最后)
+
     try:
         end_idx = sequence.index(END_TOKEN)
     except ValueError:
         end_idx = seq_len
 
-    # ==========================================
-    # Part 1: 解析 Faces
-    # 区间: START(0) + 1  ->  SEP
-    # 结构: [Coords(48), Index(1)] -> stride 49
-    # ==========================================
-    
-    # 确定 Face 数据段的起止
     face_start = 1 if sequence[0] == START_TOKEN else 0
     face_end = sep_idx
-    
     face_seq = sequence[face_start:face_end]
     num_face_tokens = len(face_seq)
-    FACE_STRIDE = 49 # 48 coords + 1 index
-    
+
     face_ctrs = []
-    # 查表法：用于将「全局面索引」（经过 cyclic offset 后的值）映射回
-    # 当前序列中的「局部面编号」(0 ~ num_face-1)
     global_to_local_face_idx = None
-    
-    if num_face_tokens > 0 and num_face_tokens % FACE_STRIDE == 0:
-        # 使用 numpy 进行快速切片处理
+
+    if num_face_tokens > 0 and num_face_tokens % face_stride == 0:
         face_arr = np.array(face_seq, dtype=np.int32)
-        # Reshape 为 (N_faces, 49)
-        face_arr = face_arr.reshape(-1, FACE_STRIDE)
-        
-        # 提取坐标部分: 前48个是坐标
-        # 减去 quantization_offset 还原为 0~(quantization_size-1) 的量化索引
-        coords_tokens = face_arr[:, :48] - quantization_offset
-        
-        # 提取索引部分: 第49个是面索引 (已经在 2sequence_nurbs.py 中进行了 cyclic offset)
-        # 这里减去 face_index_offset 得到「全局面索引」g_i
-        indices_tokens = face_arr[:, 48] - face_index_offset  # 形状: (num_face,)
-        
-        # 校验合法性 (简单的范围检查，防止坏数据导致 crash)
+        face_arr = face_arr.reshape(-1, face_stride)
+        coords_tokens = face_arr[:, :face_token_count] - quantization_offset
+        indices_tokens = face_arr[:, face_token_count] - face_index_offset
+
         if np.any(coords_tokens < 0) or np.any(coords_tokens >= quantization_size):
             if verbose: print("Warning: Invalid coordinate tokens detected in Faces.")
-            # 可以选择在这里截断或继续
-        
-        # 反量化: (N, 48) -> (N, 16, 3)
-        dequantized = dequantize_se(coords_tokens, num_tokens=quantization_size)
-        face_ctrs = dequantized.reshape(-1, 16, 3)
 
-        # 构建查找表：全局面索引 g_i -> 本序列中的局部面编号 i (0 ~ num_face-1)
-        # 这样就可以在解析 Edge 段时，把边引用的全局索引还原到当前序列的面编号空间，
-        # 自动抵消 2sequence_nurbs.py 中的 face_index_map (cyclic offset) 影响。
+        vqvae_model, _ = get_nurbs_vqvae_model(device)
+        decoded_faces = decode_tokens_to_ncs(
+            coords_tokens.tolist(),
+            vqvae_model=vqvae_model,
+            data_type='face',
+            tokens_per_element=face_token_count,
+            device=device,
+        )
+        face_ctrs = [np.asarray(face_data, dtype=np.float32).reshape(16, 3) for face_data in decoded_faces]
+
         global_to_local_face_idx = {
             int(g_idx): int(i) for i, g_idx in enumerate(indices_tokens)
         }
         if verbose:
             print(f"[NURBS解析] Face 段解析得到 {len(face_ctrs)} 个面，构建了 {len(global_to_local_face_idx)} 个全局→局部面索引映射。")
-        
-    elif num_face_tokens > 0:
-        if verbose: print(f"Warning: Face sequence length {num_face_tokens} is not a multiple of {FACE_STRIDE}.")
 
-    # ==========================================
-    # Part 2: 解析 Edges
-    # 区间: SEP + 1  ->  END
-    # 结构: [Index1(1), Index2(1), Coords(12)] -> stride 14
-    # ==========================================
-    
+    elif num_face_tokens > 0:
+        if verbose: print(f"Warning: Face sequence length {num_face_tokens} is not a multiple of {face_stride}.")
+
     edge_start = sep_idx + 1
     edge_end = end_idx
-    
     edge_seq = sequence[edge_start:edge_end]
     num_edge_tokens = len(edge_seq)
-    EDGE_STRIDE = 14 # 2 indices + 12 coords
-    
+
     edge_ctrs = []
     edge_face_pairs = []
-    
-    if num_edge_tokens > 0 and num_edge_tokens % EDGE_STRIDE == 0:
+
+    if num_edge_tokens > 0 and num_edge_tokens % edge_stride == 0:
         edge_arr = np.array(edge_seq, dtype=np.int32)
-        # Reshape 为 (N_edges, 14)
-        edge_arr = edge_arr.reshape(-1, EDGE_STRIDE)
-        
-        # 提取索引部分: 前2个是面索引 (同样经过了 face_index_map 的 cyclic offset)
-        # 这里先减去 face_index_offset 得到「全局面索引」g1, g2
+        edge_arr = edge_arr.reshape(-1, edge_stride)
         adj_tokens_global = edge_arr[:, :2] - face_index_offset  # 形状: (N_edges, 2)
-        
-        # 提取坐标部分: 后12个是坐标
         coords_tokens = edge_arr[:, 2:] - quantization_offset
-        
-        # 校验坐标范围
+
         if np.any(coords_tokens < 0) or np.any(coords_tokens >= quantization_size):
             if verbose: print("Warning: Invalid coordinate tokens detected in Edges.")
-        
-        # 使用查表法，将「全局面索引」映射回当前序列中的「局部面编号」
+
         edge_face_pairs = []
+        valid_edge_rows = []
         if global_to_local_face_idx is not None and len(global_to_local_face_idx) > 0:
             num_faces_local = len(global_to_local_face_idx)
-            for pair in adj_tokens_global:
+            for row_idx, pair in enumerate(adj_tokens_global):
                 g1, g2 = int(pair[0]), int(pair[1])
                 if (g1 in global_to_local_face_idx) and (g2 in global_to_local_face_idx):
                     f1 = global_to_local_face_idx[g1]
                     f2 = global_to_local_face_idx[g2]
                     edge_face_pairs.append((f1, f2))
+                    valid_edge_rows.append(row_idx)
                 else:
                     if verbose:
                         print(
@@ -700,22 +692,25 @@ def parse_sequence_to_cad_data_nurbs(sequence, vocab_info, device="cpu", verbose
                             f"({g1}, {g2}) w.r.t {num_faces_local} parsed faces，跳过该边。"
                         )
         else:
-            # 理论上不会触发：有 Edge 就应当有 Face；这里作为兜底逻辑，保持原始行为
             if verbose:
                 print("Warning: global_to_local_face_idx 为空，Edge 段暂时按原始索引解析（可能存在越界风险）。")
             edge_face_pairs = [tuple(pair) for pair in adj_tokens_global]
-        
-        # 反量化: (N, 12) -> (N, 4, 3)
-        dequantized = dequantize_se(coords_tokens, num_tokens=quantization_size)
-        edge_ctrs = dequantized.reshape(-1, 4, 3)
-        
-    elif num_edge_tokens > 0:
-        if verbose: print(f"Warning: Edge sequence length {num_edge_tokens} is not a multiple of {EDGE_STRIDE}.")
+            valid_edge_rows = list(range(len(adj_tokens_global)))
 
-    # ==========================================
-    # Return
-    # ==========================================
-    
+        vqvae_model, _ = get_nurbs_vqvae_model(device)
+        valid_coords_tokens = coords_tokens[valid_edge_rows] if len(valid_edge_rows) > 0 else np.zeros((0, edge_token_count), dtype=np.int32)
+        decoded_edges = decode_tokens_to_ncs(
+            valid_coords_tokens.tolist(),
+            vqvae_model=vqvae_model,
+            data_type='edge',
+            tokens_per_element=edge_token_count,
+            device=device,
+        )
+        edge_ctrs = [np.asarray(edge_data, dtype=np.float32).reshape(4, 3) for edge_data in decoded_edges]
+
+    elif num_edge_tokens > 0:
+        if verbose: print(f"Warning: Edge sequence length {num_edge_tokens} is not a multiple of {edge_stride}.")
+
     if verbose:
         print(f"Parsed CAD Data: {len(face_ctrs)} Faces, {len(edge_ctrs)} Edges")
 
@@ -730,8 +725,8 @@ def check_nurbs_format(sequence: List[int], vocab_info: Dict) -> float:
     """
     检查序列是否符合 NURBS 格式规范，返回 0.0 ~ 1.0 的格式分
     格式要求: [START] [Faces...] [SEP] [Edges...] [END]
-    Faces Block: 必须是 49 的倍数
-    Edges Block: 必须是 14 的倍数
+    Faces Block: 必须是 5 的倍数
+    Edges Block: 必须是 6 的倍数
     """
     START_TOKEN = vocab_info.get('START_TOKEN')
     SEP_TOKEN = vocab_info.get('SEP_TOKEN')
@@ -752,7 +747,7 @@ def check_nurbs_format(sequence: List[int], vocab_info: Dict) -> float:
     face_block = sequence[face_start_idx : sep_idx]
     len_faces = len(face_block)
     
-    FACE_STRIDE = 49
+    FACE_STRIDE = int(vocab_info.get("face_block", 5))
     if len_faces == 0 or len_faces % FACE_STRIDE != 0:
         # Face 块长度不对
         return 0.3
@@ -767,7 +762,7 @@ def check_nurbs_format(sequence: List[int], vocab_info: Dict) -> float:
         edge_block = sequence[edge_start_idx:]
         
     len_edges = len(edge_block)
-    EDGE_STRIDE = 14
+    EDGE_STRIDE = int(vocab_info.get("edge_block", 6))
     
     if len_edges > 0 and len_edges % EDGE_STRIDE != 0:
         # Edge 块长度不对
@@ -1420,13 +1415,24 @@ def convert_vqvae_output_to_ncs(reconstructed_tensor, data_type='face'):
     else:
         raise ValueError(f"Unknown data_type: {data_type}")
 
+
+def _gp_pnt_from_coord(coord):
+    coord = np.asarray(coord, dtype=np.float64).reshape(-1)
+    if coord.shape[0] != 3:
+        raise ValueError(f"gp_Pnt expects a 3D coordinate, got shape {coord.shape}")
+    if not np.isfinite(coord).all():
+        raise ValueError(f"gp_Pnt coordinate contains NaN/Inf: {coord.tolist()}")
+    return gp_Pnt(float(coord[0]), float(coord[1]), float(coord[2]))
+
+
 def create_bspline_curve(ctrs):
 
+    ctrs = np.asarray(ctrs, dtype=np.float64)
     assert ctrs.shape[0] == 4
 
     poles = TColgp_Array1OfPnt(1, 4)
     for i, ctr in enumerate(ctrs, 1):
-        poles.SetValue(i, gp_Pnt(*ctr))
+        poles.SetValue(i, _gp_pnt_from_coord(ctr))
 
     n_knots = 2
     knots = TColStd_Array1OfReal(1, n_knots)
@@ -1443,13 +1449,14 @@ def create_bspline_curve(ctrs):
 
 def create_bspline_surface(ctrs):
 
+    ctrs = np.asarray(ctrs, dtype=np.float64)
     assert ctrs.shape[0] == 16
 
     poles = TColgp_Array2OfPnt(1, 4, 1, 4)
     for i in range(4):
         for j in range(4):
             idx = i * 4 + j
-            poles.SetValue(i + 1, j + 1, gp_Pnt(*ctrs[idx]))
+            poles.SetValue(i + 1, j + 1, _gp_pnt_from_coord(ctrs[idx]))
 
     u_knots = TColStd_Array1OfReal(1, 2)
     v_knots = TColStd_Array1OfReal(1, 2)

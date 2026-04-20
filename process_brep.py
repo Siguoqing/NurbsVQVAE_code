@@ -1,3 +1,4 @@
+from ast import arg
 import os 
 import pickle 
 import argparse
@@ -5,10 +6,11 @@ from tqdm import tqdm
 from multiprocessing.pool import Pool
 from convert_utils import *
 from occwl.io import load_step
+import shutup; shutup.please()
 
 
 # To speed up processing, define maximum threshold
-MAX_FACE = 70
+MAX_FACE = 200
 
 def normalize(surf_pnts, edge_pnts, corner_pnts):
     """
@@ -141,91 +143,63 @@ def parse_solid(solid):
     return data
 
 
-def process(step_folder):
-    """
-    Helper function to load step files and process in parallel
-
-    Args:
-    - step_folder (str): Path to the STEP parent folder.
-
-    Returns:
-    - Complete status: Valid (1) / Non-valid (0).
-    """
+def process(args):
+    step_folder, OUTPUT, INPUT_ROOT = args
     try:
         # Load cad data
         if step_folder.endswith('.step'):
             step_path = step_folder 
-            process_furniture = True
         else:
             for _, _, files in os.walk(step_folder):
                 assert len(files) == 1 
                 step_path = os.path.join(step_folder, files[0])
-            process_furniture = False
 
         # Check single solid
         cad_solid = load_step(step_path)
         if len(cad_solid)!=1: 
-            print('Skipping multi solids...')
             return 0 
-            
         # Start data parsing
         data = parse_solid(cad_solid[0])
         if data is None: 
-            print ('Exceeding threshold...')
-            return 0 # number of faces or edges exceed pre-determined threshold
+            return 0
 
-        # Save the parsed result 
-        if process_furniture:
-            data_uid = step_path.split('/')[-2] + '_' + step_path.split('/')[-1]
-            sub_folder = step_path.split('/')[-3]
-        else:
-            data_uid = step_path.split('/')[-2]
-            sub_folder = data_uid[:4]
-            
-        if data_uid.endswith('.step'):
-            data_uid = data_uid[:-5] # furniture avoid .step
-
-        data['uid'] = data_uid
-        save_folder = os.path.join(OUTPUT, sub_folder)
-        if not os.path.exists(save_folder):
-            os.makedirs(save_folder)
-
-        save_path = os.path.join(save_folder, data['uid']+'.pkl')
+        # Preserve directory structure consistent with original STEP files (commented out)
+        # rel_path = os.path.relpath(step_path, INPUT_ROOT)
+        # rel_dir = os.path.dirname(rel_path)
+        # base_name = os.path.splitext(os.path.basename(step_path))[0]
+        # save_folder = os.path.join(OUTPUT, rel_dir)
+        # os.makedirs(save_folder, exist_ok=True)
+        # save_path = os.path.join(save_folder, base_name + '.pkl')
+        # with open(save_path, "wb") as tf:
+        #     pickle.dump(data, tf)
+        
+        # Save directly under the OUTPUT folder
+        base_name = os.path.splitext(os.path.basename(step_path))[0]
+        os.makedirs(OUTPUT, exist_ok=True)
+        save_path = os.path.join(OUTPUT, base_name + '.pkl')
         with open(save_path, "wb") as tf:
             pickle.dump(data, tf)
-
         return 1 
-
     except Exception as e:
-        print('not saving due to error...')
         return 0
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", type=str, help="Data folder path", required=True)
-    parser.add_argument("--option", type=str, choices=['abc', 'deepcad', 'furniture'], default='abc', 
-                        help="Choose between dataset option [abc/deepcad/furniture] (default: abc)")
-    parser.add_argument("--interval", type=int, help="Data range index, only required for abc/deepcad")
-    args = parser.parse_args()    
-
-    if args.option == 'deepcad': 
-        OUTPUT = 'deepcad_parsed'
-    elif args.option == 'abc': 
-        OUTPUT = 'abc_parsed'
-    else:
-        OUTPUT = 'furniture_parsed'
+    parser.add_argument("--input", type=str, help="Data folder path", default='')
+    parser.add_argument("--output", type=str, help="Output folder path", default='data/deepcad_parsed')
+    parser.add_argument("--interval", type=int, default=0, help="Data range index, only required for abc/deepcad")
+    args = parser.parse_args()
     
+
+    OUTPUT = args.output
     # Load all STEP files
-    if args.option == 'furniture':
-        step_dirs = load_furniture_step(args.input)
-    else:
-        step_dirs = load_abc_step(args.input, args.option=='deepcad')
-        step_dirs = step_dirs[args.interval*10000 : (args.interval+1)*10000]
+    step_dirs = load_step(args.input)
+
 
     # Process B-reps in parallel
     valid = 0
-    convert_iter = Pool(os.cpu_count()).imap(process, step_dirs) 
+    # Pass (file_path, OUTPUT, INPUT_ROOT) tuples to each process
+    convert_iter = Pool(os.cpu_count()).imap(process, [(step_dir, OUTPUT, args.input) for step_dir in step_dirs]) 
     for status in tqdm(convert_iter, total=len(step_dirs)):
         valid += status 
     print(f'Done... Data Converted Ratio {100.0*valid/len(step_dirs)}%')

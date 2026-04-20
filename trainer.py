@@ -6,10 +6,89 @@ import torch.nn as nn
 import torch.nn.functional as F
 import time
 import math
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from typing import List, Dict, Optional, Tuple
+
+
+class LengthBucketBatchSampler(Sampler):
+    """
+    Build batches from similarly sized token sequences.
+
+    This prevents one very long v2 CAD sequence from forcing many short
+    sequences in the same batch to pad up to a huge attention length.
+    """
+
+    def __init__(
+        self,
+        lengths,
+        batch_size: int,
+        num_replicas: int = 1,
+        rank: int = 0,
+        shuffle: bool = True,
+        drop_last: bool = True,
+        bucket_mult: int = 16,
+        seed: int = 42,
+    ):
+        self.lengths = [int(x) for x in lengths]
+        self.batch_size = int(batch_size)
+        self.num_replicas = int(num_replicas)
+        self.rank = int(rank)
+        self.shuffle = bool(shuffle)
+        self.drop_last = bool(drop_last)
+        self.bucket_mult = max(int(bucket_mult), 1)
+        self.seed = int(seed)
+        self.epoch = 0
+
+        if self.batch_size <= 0:
+            raise ValueError("batch_size must be positive")
+        if self.num_replicas <= 0:
+            raise ValueError("num_replicas must be positive")
+        if not (0 <= self.rank < self.num_replicas):
+            raise ValueError("rank must be in [0, num_replicas)")
+
+        global_batch = self.batch_size * self.num_replicas
+        self.num_batches = len(self.lengths) // global_batch if self.drop_last else math.ceil(len(self.lengths) / global_batch)
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
+
+    def __len__(self):
+        return self.num_batches
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+
+        sorted_indices = sorted(range(len(self.lengths)), key=lambda idx: self.lengths[idx])
+        global_batch = self.batch_size * self.num_replicas
+        bucket_size = max(global_batch * self.bucket_mult, global_batch)
+        buckets = [sorted_indices[i:i + bucket_size] for i in range(0, len(sorted_indices), bucket_size)]
+
+        bucket_order = torch.randperm(len(buckets), generator=generator).tolist() if self.shuffle else list(range(len(buckets)))
+        global_batches = []
+        for bucket_idx in bucket_order:
+            bucket = list(buckets[bucket_idx])
+            if self.shuffle:
+                perm = torch.randperm(len(bucket), generator=generator).tolist()
+                bucket = [bucket[i] for i in perm]
+
+            for start_idx in range(0, len(bucket), global_batch):
+                chunk = bucket[start_idx:start_idx + global_batch]
+                if len(chunk) < global_batch:
+                    if self.drop_last:
+                        continue
+                    chunk = chunk + chunk[:global_batch - len(chunk)]
+                global_batches.append(chunk)
+
+        if self.shuffle:
+            order = torch.randperm(len(global_batches), generator=generator).tolist()
+            global_batches = [global_batches[i] for i in order]
+
+        for chunk in global_batches[:self.num_batches]:
+            start_idx = self.rank * self.batch_size
+            yield chunk[start_idx:start_idx + self.batch_size]
 
 
 class ARTrainer:
@@ -102,26 +181,49 @@ class ARTrainer:
         if self.multi_gpu and torch.cuda.device_count() > 1 and dist.is_available() and dist.is_initialized():
             num_workers = 0
             effective_batch_size = self.batch_size
-            train_sampler = DistributedSampler(train_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(),
-                                               shuffle=True)
+            train_sampler = None
+            train_batch_sampler = None
+            if hasattr(train_dataset, "sequence_lengths") and len(getattr(train_dataset, "sequence_lengths", [])) == len(train_dataset):
+                train_batch_sampler = LengthBucketBatchSampler(
+                    train_dataset.sequence_lengths,
+                    batch_size=effective_batch_size,
+                    num_replicas=dist.get_world_size(),
+                    rank=dist.get_rank(),
+                    shuffle=True,
+                    drop_last=True,
+                    bucket_mult=getattr(self.args, "length_bucket_mult", 16),
+                )
+            else:
+                train_sampler = DistributedSampler(train_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(),
+                                                   shuffle=True)
             val_sampler = DistributedSampler(val_dataset, num_replicas=dist.get_world_size(), rank=dist.get_rank(),
-                                             shuffle=False)
+                                            shuffle=False)
             train_shuffle = False
             if self.rank == 0:
+                sampler_name = "LengthBucketBatchSampler" if train_batch_sampler is not None else "DistributedSampler"
                 print(
-                    f"Distributed: World={dist.get_world_size()}, Batch/GPU={effective_batch_size}, Workers={num_workers}")
+                    f"Distributed: World={dist.get_world_size()}, Batch/GPU={effective_batch_size}, "
+                    f"Workers={num_workers}, Sampler={sampler_name}")
         else:
             num_workers = 0
             effective_batch_size = self.batch_size
             train_sampler = None
+            train_batch_sampler = None
             val_sampler = None
             train_shuffle = True
 
-        self.train_dataloader = DataLoader(
-            train_dataset, batch_size=effective_batch_size, shuffle=train_shuffle,
-            sampler=train_sampler, drop_last=True, num_workers=num_workers,
-            collate_fn=train_dataset.collate_fn, pin_memory=False
-        )
+        if train_batch_sampler is not None:
+            self.train_dataloader = DataLoader(
+                train_dataset, batch_sampler=train_batch_sampler, num_workers=num_workers,
+                collate_fn=train_dataset.collate_fn, pin_memory=False
+            )
+            train_sampler = train_batch_sampler
+        else:
+            self.train_dataloader = DataLoader(
+                train_dataset, batch_size=effective_batch_size, shuffle=train_shuffle,
+                sampler=train_sampler, drop_last=True, num_workers=num_workers,
+                collate_fn=train_dataset.collate_fn, pin_memory=False
+            )
         self.val_dataloader = DataLoader(
             val_dataset, batch_size=effective_batch_size, shuffle=False,
             sampler=val_sampler, drop_last=False, num_workers=num_workers,
@@ -169,7 +271,8 @@ class ARTrainer:
             dropout=self.dropout, max_seq_len=self.max_seq_len, rope_theta=self.rope_theta,
             rms_norm_eps=self.rms_norm_eps, pad_token_id=self.PAD_TOKEN,
             quantization_offset=self.quantization_offset, face_index_offset=self.face_index_offset,
-            num_components=1
+            num_components=1,
+            point_prefix_tokens=getattr(self.args, 'point_prefix_tokens', 8),
         )
         self.model = LLaMA3ARModel(config).to(self.device)
         if self.gradient_checkpointing and hasattr(self.model, 'gradient_checkpointing_enable'):
@@ -384,10 +487,12 @@ class ARTrainer:
             if 'model_state_dict' in checkpoint:
                 model_to_load = self.model.module if hasattr(self.model, 'module') else self.model
                 new_state = {k.replace('module.', ''): v for k, v in checkpoint['model_state_dict'].items()}
-                try:
-                    model_to_load.load_state_dict(new_state, strict=True)
-                except Exception as e:
-                    model_to_load.load_state_dict(new_state, strict=False)
+                model_state = model_to_load.state_dict()
+                compatible_state = {
+                    key: value for key, value in new_state.items()
+                    if key in model_state and model_state[key].shape == value.shape
+                }
+                model_to_load.load_state_dict(compatible_state, strict=False)
 
             self.start_epoch = 1
             self.epoch = 1

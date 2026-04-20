@@ -129,7 +129,7 @@ def load_furniture_pkl(root_dir):
     return train_uid, val_uid, test_uid
 
 
-def load_abc_step(root_dir, use_deepcad):
+def load_step(root_dir, use_deepcad):
     """
     Recursively searches through a given parent directory and its subdirectories
     to find the paths of all ABC STEP files.
@@ -161,7 +161,7 @@ def load_abc_step(root_dir, use_deepcad):
     return step_dirs
 
 
-def load_furniture_step(root_dir):
+def load_step(root_dir):
     """
     Recursively searches through a given parent directory and its subdirectories
     to find the paths of all Furniture STEP files.

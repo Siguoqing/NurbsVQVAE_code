@@ -90,6 +90,9 @@ def single_gpu_train(args):
           f"{train_dataset.face_index_offset} ~ {train_dataset.face_index_offset + train_dataset.face_index_size - 1}")
     print(f"  量化tokens ({train_dataset.quantization_size}个): "
           f"{train_dataset.quantization_offset} ~ {train_dataset.quantization_offset + train_dataset.quantization_size - 1}")
+    if getattr(train_dataset, "bbox_token_offset", None) is not None and getattr(train_dataset, "bbox_index_size", 0):
+        print(f"  BBox tokens ({train_dataset.bbox_index_size}个): "
+              f"{train_dataset.bbox_token_offset} ~ {train_dataset.bbox_token_offset + train_dataset.bbox_index_size - 1}")
     print(f"  特殊Tokens ({train_dataset.special_token_size}个): "
           f"START={train_dataset.START_TOKEN}, SEP={train_dataset.SEP_TOKEN}, "
           f"END={train_dataset.END_TOKEN}, PAD={train_dataset.PAD_TOKEN}")
@@ -181,6 +184,9 @@ def multi_gpu_train(args, local_rank, world_size, rank):
               f"{train_dataset.face_index_offset} ~ {train_dataset.face_index_offset + train_dataset.face_index_size - 1}")
         print(f"  量化tokens ({train_dataset.quantization_size}个): "
               f"{train_dataset.quantization_offset} ~ {train_dataset.quantization_offset + train_dataset.quantization_size - 1}")
+        if getattr(train_dataset, "bbox_token_offset", None) is not None and getattr(train_dataset, "bbox_index_size", 0):
+            print(f"  BBox tokens ({train_dataset.bbox_index_size}个): "
+                  f"{train_dataset.bbox_token_offset} ~ {train_dataset.bbox_token_offset + train_dataset.bbox_index_size - 1}")
         print(f"  特殊Tokens ({train_dataset.special_token_size}个): "
               f"START={train_dataset.START_TOKEN}, SEP={train_dataset.SEP_TOKEN}, "
               f"END={train_dataset.END_TOKEN}, PAD={train_dataset.PAD_TOKEN}")

@@ -1,0 +1,11 @@
+{
+  "total_files": 18449,
+  "ok": 469,
+  "partially_invalid": 0,
+  "all_invalid": 17980,
+  "empty": 0,
+  "bad_shape": 0,
+  "load_failed": 0,
+  "missing": 0,
+  "avg_valid_ratio": 0.02542143205593799
+}

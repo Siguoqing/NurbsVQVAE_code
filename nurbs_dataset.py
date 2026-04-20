@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import os
 import pickle
+import random
 from dataclasses import dataclass
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -29,12 +30,14 @@ class NurbsVQDataset(Dataset):
         self,
         data_dir: str,
         split: str = "train",
+        file_paths: Optional[Sequence[str]] = None,
         split_ratio: float = 0.95,
         seed: int = 42,
         max_files: Optional[int] = None,
         use_type_flag: bool = True,
         include_faces: bool = True,
         include_edges: bool = True,
+        aug: bool = False,
     ) -> None:
         if split not in {"train", "val"}:
             raise ValueError(f"split must be 'train' or 'val', got {split!r}")
@@ -46,17 +49,23 @@ class NurbsVQDataset(Dataset):
         self.use_type_flag = use_type_flag
         self.include_faces = include_faces
         self.include_edges = include_edges
+        self.aug = bool(aug and split == "train")
         self.items: List[Tuple[str, np.ndarray]] = []
 
-        all_pkl_files = self._collect_pkl_files(data_dir)
-        rng = np.random.default_rng(seed)
-        rng.shuffle(all_pkl_files)
+        if file_paths is None:
+            all_pkl_files = self._collect_pkl_files(data_dir)
+            rng = np.random.default_rng(seed)
+            rng.shuffle(all_pkl_files)
 
-        if max_files is not None:
-            all_pkl_files = all_pkl_files[: max(0, int(max_files))]
+            if max_files is not None:
+                all_pkl_files = all_pkl_files[: max(0, int(max_files))]
 
-        split_idx = int(len(all_pkl_files) * split_ratio)
-        data_paths = all_pkl_files[:split_idx] if split == "train" else all_pkl_files[split_idx:]
+            split_idx = int(len(all_pkl_files) * split_ratio)
+            data_paths = all_pkl_files[:split_idx] if split == "train" else all_pkl_files[split_idx:]
+        else:
+            data_paths = list(file_paths)
+            if max_files is not None:
+                data_paths = data_paths[: max(0, int(max_files))]
 
         num_faces = 0
         num_edges = 0
@@ -150,8 +159,33 @@ class NurbsVQDataset(Dataset):
     def __len__(self) -> int:
         return len(self.items)
 
+    @staticmethod
+    def _rotate_point_cloud(points: np.ndarray, angle_deg: int, axis: str) -> np.ndarray:
+        angle = np.deg2rad(float(angle_deg))
+        c, s = np.cos(angle), np.sin(angle)
+        if axis == "x":
+            rot = np.array([[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]], dtype=np.float32)
+        elif axis == "y":
+            rot = np.array([[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]], dtype=np.float32)
+        elif axis == "z":
+            rot = np.array([[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]], dtype=np.float32)
+        else:
+            raise ValueError(f"Unsupported rotation axis: {axis}")
+        return points @ rot.T
+
+    def _maybe_augment(self, controls: np.ndarray) -> np.ndarray:
+        if not self.aug or np.random.rand() <= 0.5:
+            return controls
+
+        augmented = controls.reshape(-1, 3).copy()
+        for axis in ("x", "y", "z"):
+            angle = random.choice((90, 180, 270))
+            augmented = self._rotate_point_cloud(augmented, angle, axis)
+        return augmented.reshape(controls.shape).astype(np.float32, copy=False)
+
     def __getitem__(self, idx: int) -> torch.Tensor:
         item_type, item_data = self.items[idx]
+        item_data = self._maybe_augment(item_data)
 
         if item_type == "face":
             grid = item_data.reshape(4, 4, 3)
@@ -166,13 +200,23 @@ class NurbsVQDataset(Dataset):
 
 def build_nurbs_train_val_datasets(
     data_dir: str,
+    data_list: Optional[str] = None,
     split_ratio: float = 0.95,
     seed: int = 42,
     max_files: Optional[int] = None,
     use_type_flag: bool = True,
     include_faces: bool = True,
     include_edges: bool = True,
+    aug: bool = False,
 ) -> Tuple[NurbsVQDataset, NurbsVQDataset]:
+    train_paths = None
+    val_paths = None
+    if data_list:
+        with open(data_list, "rb") as f:
+            split_data = pickle.load(f)
+        train_paths = split_data.get("train", [])
+        val_paths = split_data.get("val", [])
+
     common_kwargs = {
         "data_dir": data_dir,
         "split_ratio": split_ratio,
@@ -181,9 +225,10 @@ def build_nurbs_train_val_datasets(
         "use_type_flag": use_type_flag,
         "include_faces": include_faces,
         "include_edges": include_edges,
+        "aug": aug,
     }
-    train_dataset = NurbsVQDataset(split="train", **common_kwargs)
-    val_dataset = NurbsVQDataset(split="val", **common_kwargs)
+    train_dataset = NurbsVQDataset(split="train", file_paths=train_paths, **common_kwargs)
+    val_dataset = NurbsVQDataset(split="val", file_paths=val_paths, **common_kwargs)
     return train_dataset, val_dataset
 
 

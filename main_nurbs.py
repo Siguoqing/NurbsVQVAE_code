@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train a clean NURBS VQ-VAE baseline")
 
     parser.add_argument("--data_dir", type=str, default=DEFAULT_DATA_DIR, help="Directory containing CAD .pkl files")
+    parser.add_argument("--data_list", type=str, default="", help="Optional split pickle with explicit train/val file lists")
     parser.add_argument("--save_dir", type=str, default="checkpoints_vqvae/restart_baseline")
     parser.add_argument("--tb_log_dir", type=str, default="logs/nurbs_vqvae/restart_baseline")
     parser.add_argument("--weight", type=str, default="", help="Checkpoint path to resume from")
@@ -40,9 +41,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--use_type_flag", type=str2bool, default=True)
     parser.add_argument("--include_faces", type=str2bool, default=True)
     parser.add_argument("--include_edges", type=str2bool, default=True)
+    parser.add_argument("--aug", type=str2bool, default=True, help="Enable train-time rotation augmentation")
 
     parser.add_argument("--batch_size", type=int, default=1536, help="Per-GPU batch size under DDP")
-    parser.add_argument("--train_nepoch", type=int, default=200)
+    parser.add_argument("--train_nepoch", type=int, default=500)
     parser.add_argument("--test_nepoch", type=int, default=1)
     parser.add_argument("--save_nepoch", type=int, default=10)
     parser.add_argument("--learning_rate", type=float, default=1e-4)
@@ -53,11 +55,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--amp", type=str2bool, default=True)
     parser.add_argument("--best_metric", choices=["recon_loss", "total_loss", "precision_score"], default="recon_loss")
 
-    parser.add_argument("--quantization_size", type=int, default=4096)
-    parser.add_argument("--model_down_blocks", type=int, default=1)
+    parser.add_argument("--quantization_size", type=int, default=1024)
+    parser.add_argument("--model_down_blocks", type=int, default=2)
     parser.add_argument("--base_channel_dim", type=int, default=64)
     parser.add_argument("--latent_channels", type=int, default=128)
-    parser.add_argument("--vq_embed_dim", type=int, default=64)
+    parser.add_argument("--vq_embed_dim", type=int, default=32)
     parser.add_argument("--vq_loss_weight", type=float, default=1.0)
     parser.add_argument("--vq_distance", choices=["cos", "l2"], default="cos")
     parser.add_argument("--vq_anchor", choices=["probrandom", "closest", "random"], default="probrandom")
@@ -65,7 +67,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vq_contras_loss", type=str2bool, default=True)
     parser.add_argument("--vq_beta", type=float, default=None)
 
-    parser.add_argument("--recon_l1_weight", type=float, default=0.5)
+    parser.add_argument("--recon_l1_weight", type=float, default=0.0)
     parser.add_argument("--face_boundary_weight", type=float, default=0.0)
     parser.add_argument("--face_corner_weight", type=float, default=0.0)
     parser.add_argument("--edge_endpoint_weight", type=float, default=0.0)
@@ -98,12 +100,14 @@ def main(argv=None):
 
     train_dataset, val_dataset = build_nurbs_train_val_datasets(
         data_dir=args.data_dir,
+        data_list=args.data_list or None,
         split_ratio=args.split_ratio,
         seed=args.seed,
         max_files=args.max_files,
         use_type_flag=args.use_type_flag,
         include_faces=args.include_faces,
         include_edges=args.include_edges,
+        aug=args.aug,
     )
 
     if rank == 0:

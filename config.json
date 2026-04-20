@@ -1,5 +1,5 @@
 {
-    "vocab_size": 1078,
+    "vocab_size": 3126,
     "d_model": 512,
     "n_layers": 8,
     "n_heads": 8,
@@ -10,9 +10,18 @@
     "face_index_size": 50,
     "quantization_offset": 50,
     "quantization_size": 1024,
-    "START_TOKEN": 1074,
-    "SEP_TOKEN": 1075,
-    "END_TOKEN": 1076,
-    "PAD_TOKEN": 1077,
-    "num_components": 3
+    "bbox_token_offset": 1074,
+    "bbox_index_size": 2048,
+    "bbox_tokens_per_element": 6,
+    "face_vq_tokens": 4,
+    "edge_vq_tokens": 4,
+    "se_tokens_per_element": 4,
+    "face_block": 11,
+    "edge_block": 12,
+    "START_TOKEN": 3122,
+    "SEP_TOKEN": 3123,
+    "END_TOKEN": 3124,
+    "PAD_TOKEN": 3125,
+    "num_components": 1,
+    "point_prefix_tokens": 8
 }

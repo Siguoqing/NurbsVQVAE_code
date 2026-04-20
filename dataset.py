@@ -1,9 +1,9 @@
 import random
 import os
 import torch
-import numpy as np
 import pickle
 from torch.utils.data import Dataset
+from pointcloud_condition import load_and_preprocess_point_cloud, resolve_point_cloud_path
 
 
 class NurbsARData(Dataset):
@@ -17,6 +17,8 @@ class NurbsARData(Dataset):
         self.args = args
         # 兼容处理：防止 args 为空时报错
         self.max_seq_len = getattr(args, 'max_seq_len', 2048) if args else 2048
+        self.point_cloud_npoints = getattr(args, 'point_cloud_npoints', 2048) if args else 2048
+        self.point_cloud_normalize = getattr(args, 'point_cloud_normalize', True) if args else True
         self.validate = validate
         self.point_cloud_dir = point_cloud_dir
 
@@ -57,6 +59,8 @@ class NurbsARData(Dataset):
             self.special_token_size = data["special_token_size"]
             self.face_index_size = data["face_index_size"]
             self.quantization_size = data["quantization_size"]
+            self.bbox_index_size = data.get("bbox_index_size", data.get("bbox_size", 0))
+            self.bbox_token_offset = data.get("bbox_token_offset", None)
             self.face_index_offset = data["face_index_offset"]
             self.quantization_offset = data["quantization_offset"]
 
@@ -67,10 +71,11 @@ class NurbsARData(Dataset):
             self.START_TOKEN = special_tokens["START_TOKEN"]
             self.SEP_TOKEN = special_tokens["SEP_TOKEN"]
             self.END_TOKEN = special_tokens["END_TOKEN"]
-            self.PAD_TOKEN = self.vocab_size
+            self.PAD_TOKEN = special_tokens.get("PAD_TOKEN", data.get("PAD_TOKEN", self.vocab_size))
 
             # --- 解析纯粹的 1D NLP 序列 ---
             self.groups = []
+            self.sequence_lengths = []
             filtered_count = 0
             error_count = 0
 
@@ -131,6 +136,7 @@ class NurbsARData(Dataset):
 
                 if "original" in processed_group:
                     self.groups.append(processed_group)
+                    self.sequence_lengths.append(int(processed_group["original"]["input_ids"].shape[0]))
 
             if rank == 0:
                 print(
@@ -165,14 +171,19 @@ class NurbsARData(Dataset):
 
         # 【核心新增：动态加载对应的点云矩阵】
         if self.point_cloud_dir is not None:
-            pc_path = os.path.join(self.point_cloud_dir, f"{file_name}.npy")
+            pc_path = resolve_point_cloud_path(self.point_cloud_dir, file_name)
             try:
-                pc_data = np.load(pc_path, allow_pickle=True)
-                # 假设预处理好的点云形状为 (K面, N点, 3坐标)
+                if pc_path is None:
+                    raise FileNotFoundError(file_name)
+                pc_data = load_and_preprocess_point_cloud(
+                    pc_path,
+                    num_points=self.point_cloud_npoints,
+                    normalize=self.point_cloud_normalize,
+                )
                 point_clouds = torch.tensor(pc_data, dtype=torch.float32)
             except Exception:
-                # 极个别文件丢失或读取失败时的占位处理，防止整个训练崩溃 (K=10, N=512)
-                point_clouds = torch.zeros((10, 512, 3), dtype=torch.float32)
+                # 极个别文件丢失或读取失败时的占位处理，防止整个训练崩溃
+                point_clouds = torch.zeros((self.point_cloud_npoints, 3), dtype=torch.float32)
 
             item["point_clouds"] = point_clouds
 
@@ -180,7 +191,7 @@ class NurbsARData(Dataset):
 
     def collate_fn(self, batch):
         """
-        批处理函数：1D 序列用 PAD_TOKEN 对齐，3D 点云按面数量 (K) 对齐
+        批处理函数：1D 序列用 PAD_TOKEN 对齐，全局点云直接按 batch 堆叠
         """
         input_ids = [item["input_ids"] for item in batch]
         attention_masks = [item["attention_mask"] for item in batch]
@@ -216,27 +227,9 @@ class NurbsARData(Dataset):
             "labels": final_input_ids.clone()  # 【新增】：直接生成 labels 供 LLaMA 计算 Loss
         }
 
-        # 【核心新增：点云维度对齐】
+        # 全局点云条件已经被预处理成统一的 (N, 3)，这里直接 stack 即可
         if "point_clouds" in batch[0]:
-            pcs_list = [item["point_clouds"] for item in batch]
-
-            # 因为每个零件的面数 K 不同，需要找到 Batch 里最大的 K 进行 Zero-Padding
-            max_k = max(pc.shape[0] for pc in pcs_list)
-
-            padded_pcs_list = []
-            for pc in pcs_list:
-                k, n, c = pc.shape
-                if k < max_k:
-                    # 【神级替换：真实面复制】用当前零件的第 1 个面来重复填充
-                    # 这样方差绝对正常，彻底杜绝 BatchNorm 崩溃，且会被 LLaMA 的 Mask 完美屏蔽！
-                    pad = pc[0:1].repeat(max_k - k, 1, 1)
-                    pc = torch.cat([pc, pad], dim=0)
-                elif k > max_k:
-                    # 理论上不会出现，防御性截断
-                    pc = pc[:max_k]
-                padded_pcs_list.append(pc)
-
-            batch_dict["point_clouds"] = torch.stack(padded_pcs_list)
+            batch_dict["point_clouds"] = torch.stack([item["point_clouds"] for item in batch])
 
         return batch_dict
 

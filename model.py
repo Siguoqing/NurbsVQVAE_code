@@ -27,6 +27,7 @@ class LLaMA3Config:
     quantization_offset: int = 50
     face_index_offset: int = 0
     special_token_offset: int = 4050
+    point_prefix_tokens: int = 8
     num_components: int = 1  # 彻底变为 1D
 
     def __post_init__(self):
@@ -155,26 +156,33 @@ class LLaMA3Block(nn.Module):
 
 # 点云投影器：负责点云降维和特征维度对齐
 class PointCloudPrefixProjector(nn.Module):
-    def __init__(self, ar_d_model: int):
+    def __init__(self, ar_d_model: int, prefix_tokens: int):
         super().__init__()
+        self.prefix_tokens = prefix_tokens
         # 实例化 PointNet++
         self.pointnet2 = PointNet2Backbone(normal_channel=False)
 
         # 降维映射网络
         self.projector = nn.Sequential(
-            nn.Linear(1024, 512),
+            nn.Linear(1024, 1024),
             nn.GELU(),
-            nn.Linear(512, ar_d_model)
+            nn.Linear(1024, ar_d_model * prefix_tokens)
         )
 
-    def forward(self, face_point_clouds: torch.Tensor) -> torch.Tensor:
+    def forward(self, point_clouds: torch.Tensor) -> torch.Tensor:
         """
         :param face_point_clouds: (Batch, K, N, 3) K是面数量, N是点云数量
         :return: prefix_embeds: (Batch, K, d_model)
         """
-        B, K, N, C = face_point_clouds.shape
+        if point_clouds.dim() == 4:
+            batch_size, _, _, channels = point_clouds.shape
+            point_clouds = point_clouds.reshape(batch_size, -1, channels)
+        elif point_clouds.dim() == 3:
+            batch_size = point_clouds.shape[0]
+        else:
+            raise ValueError(f"Unsupported point-cloud shape: {tuple(point_clouds.shape)}")
         # 折叠维度骗过 PointNet
-        flat_pcs = face_point_clouds.view(B * K, N, C)
+        flat_pcs = point_clouds[..., :3]
         # PointNet 要求通道在中间 (Batch, 3, N)
         flat_pcs = flat_pcs.transpose(1, 2).contiguous()
 
@@ -183,7 +191,7 @@ class PointCloudPrefixProjector(nn.Module):
         projected = self.projector(pn2_features)
 
         # 解开折叠
-        prefix_embeds = projected.view(B, K, -1)
+        prefix_embeds = projected.view(batch_size, self.prefix_tokens, -1)
         return prefix_embeds
 
 
@@ -195,7 +203,10 @@ class LLaMA3ARModel(nn.Module):
         self.token_embedding = nn.Embedding(config.vocab_size, config.d_model)
 
         # 注册点云投影器
-        self.prefix_projector = PointCloudPrefixProjector(config.d_model)
+        self.prefix_projector = PointCloudPrefixProjector(
+            config.d_model,
+            prefix_tokens=config.point_prefix_tokens,
+        )
 
         self.layers = nn.ModuleList([LLaMA3Block(config) for _ in range(config.n_layers)])
         self.norm = RMSNorm(config.d_model, eps=config.rms_norm_eps)
@@ -301,7 +312,8 @@ class LLaMA3ARModel(nn.Module):
         output = {
             'logits': logits,
             'past_key_values': present_key_values,
-            'last_hidden_state': hidden_states
+            'last_hidden_state': hidden_states,
+            'prefix_length': K,
         }
 
         # --- 5. 屏蔽点云部分的 Loss ---
@@ -328,8 +340,8 @@ class LLaMA3ARModel(nn.Module):
         outputs = self(input_ids, point_clouds=point_clouds, use_cache=False)
         # 如果有 prefix，截取最后 seq_len 个 logits
         if point_clouds is not None:
-            K = point_clouds.shape[1]
-            logits = outputs['logits'][:, K - 1:-1, :]
+            K = outputs['prefix_length']
+            logits = outputs['logits'][:, K:-1, :]
         else:
             logits = outputs['logits'][:, :-1, :]
 
